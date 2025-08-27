@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Canvas2D Catch Game (with custom images & sound)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body {
+      margin: 0; padding: 0; height: 100%; background: #111; color: #fff;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      user-select: none; -webkit-user-select: none; -ms-user-select: none;
+      overflow: hidden;
+    }
+    #game {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      touch-action: none;
+      background: #000;
+    }
+    .overlay {
+      position: fixed; left: 0; top: 0; right: 0; text-align: center; z-index: 10;
+      padding: 10px; pointer-events: none; font-size: 14px; color: #ddd;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+    }
+    .center {
+      position: fixed; left: 0; top: 0; right: 0; bottom: 0;
+      display: flex; align-items: center; justify-content: center;
+      z-index: 20; pointer-events: none;
+    }
+    .button-hint {
+      background: rgba(0,0,0,0.5);
+      padding: 10px 16px; border-radius: 10px; display: inline-block;
+      pointer-events: auto; cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div class="overlay" id="hud">Score: 0</div>
+  <div class="center" id="startOverlay">
+    <div class="button-hint">
+      <div><strong>Click, touch, or press any key to start</strong></div>
+      <div>Move: Arrow keys / A-D or pointer</div>
+      <div>Catch items, avoid rare item (70x100). Press R to restart after game over.</div>
+    </div>
+  </div>
+
+  <script>
+    // =======================
+    // Customize these assets:
+    // =======================
+    const PLAYER_IMG_SRC = './player.png';     // 70x100
+    const ITEM_IMG_SRC   = './item.png';       // 64x64
+    const RARE_IMG_SRC   = './rare.png';       // 70x100
+    const CATCH_SOUND_SRC = './audio.mp3';     // sound when catching normal item
+    const RARE_SOUND_SRC  = '';      // optional, sound on rare catch
+
+    // =======================
+    // Game constants
+    // =======================
+    const PLAYER_W = 70;
+    const PLAYER_H = 100;
+    const ITEM_W = 64;
+    const ITEM_H = 64;
+    const RARE_W = 70;
+    const RARE_H = 100;
+
+    const BASE_SPAWN_INTERVAL = 0.9; // seconds between spawns (decreases a bit with score)
+    const FALL_SPEED_BASE = 220;     // px/s
+    const FALL_SPEED_PER_SCORE = 2;  // px/s per score
+
+    const PLAYER_SPEED = 520;        // px/s with keyboard
+    const RARE_CHANCE = 0.06;        // 6% chance to spawn rare
+    const MAX_ITEMS_ON_SCREEN = 12;
+
+    // Explosion / background shard settings
+    const EXPLOSION_DURATION = 1.5;  // seconds
+    const SHARD_COLS = 16;
+    const SHARD_ROWS = 9;
+    const SHAKE_MAX = 14;            // px
+    const WHITE_FLASH_TIME = 0.12;   // seconds
+
+    // =======================
+    // Utils: loading
+        // =======================
+    function loadImage(src) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        // img.crossOrigin = 'anonymous';
+        img.onload = () => resolve(img);
+        img.onerror = (e) => reject(e);
+        img.src = src;
+      });
+    }
+    function loadAudio(src) {
+      const a = new Audio();
+      a.src = src;
+      a.preload = 'auto';
+      return a;
+    }
+    function playSound(audioEl, volume = 1.0) {
+      if (!audioEl) return;
+      try {
+        const node = audioEl.cloneNode(true);
+        node.volume = volume;
+        node.play().catch(() => {});
+      } catch (e) {}
+    }
+
+    // =======================
+    // Canvas setup with DPR
+    // =======================
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    let dpr = Math.max(1, window.devicePixelRatio || 1);
+    function resizeCanvas() {
+      dpr = Math.max(1, window.devicePixelRatio || 1);
+      const w = Math.floor(window.innerWidth);
+      const h = Math.floor(window.innerHeight);
+      canvas.width = w * dpr;
+      canvas.height = h * dpr;
+      canvas.style.width = w + 'px';
+      canvas.style.height = h + 'px';
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.scale(dpr, dpr);
+      prepareBackground(); // re-render offscreen bg for new size
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    // =======================
+    // Input
+    // =======================
+    const keys = new Set();
+    let pointerX = null; // use pointer to steer if present
+    let usingPointer = false;
+
+    window.addEventListener('keydown', (e) => {
+      keys.add(e.key.toLowerCase());
+      startIfNeeded();
+    });
+    window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
+
+    canvas.addEventListener('pointerdown', (e) => {
+      usingPointer = true;
+      pointerX = e.clientX;
+      startIfNeeded();
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      usingPointer = true;
+      pointerX = e.clientX;
+    });
+    canvas.addEventListener('pointerup', () => { /* keep pointer steering until keyboard used */ });
+
+    // =======================
+    // Background (offscreen) and shards
+    // =======================
+    const bgOff = document.createElement('canvas');
+    const bgCtx = bgOff.getContext('2d');
+
+    function prepareBackground() {
+      bgOff.width = Math.max(1, Math.floor(canvas.width / dpr));
+      bgOff.height = Math.max(1, Math.floor(canvas.height / dpr));
+      bgCtx.setTransform(1,0,0,1,0,0);
+      // Draw a simple gradient + faint grid to make the explosion shards visible
+      const g = bgCtx.createLinearGradient(0, 0, 0, bgOff.height);
+      g.addColorStop(0, '#0b1c2c');
+      g.addColorStop(1, '#132f4a');
+      bgCtx.fillStyle = g;
+      bgCtx.fillRect(0, 0, bgOff.width, bgOff.height);
+
+      // Subtle grid
+      bgCtx.strokeStyle = 'rgba(255,255,255,0.05)';
+      bgCtx.lineWidth = 1;
+      const grid = 40;
+      for (let x = 0; x <= bgOff.width; x += grid) {
+        bgCtx.beginPath();
+        bgCtx.moveTo(x + 0.5, 0);
+        bgCtx.lineTo(x + 0.5, bgOff.height);
+        bgCtx.stroke();
+      }
+      for (let y = 0; y <= bgOff.height; y += grid) {
+        bgCtx.beginPath();
+        bgCtx.moveTo(0, y + 0.5);
+        bgCtx.lineTo(bgOff.width, y + 0.5);
+        bgCtx.stroke();
+      }
+    }
+
+    let shards = null; // set when rare item explodes background
+    function createShards(explosionX, explosionY) {
+      shards = [];
+      const cw = canvas.width / dpr, ch = canvas.height / dpr;
+
+      const sw = cw / SHARD_COLS;
+      const sh = ch / SHARD_ROWS;
+
+      for (let r = 0; r < SHARD_ROWS; r++) {
+        for (let c = 0; c < SHARD_COLS; c++) {
+          const dx = c * sw;
+          const dy = r * sh;
+          const cx = dx + sw / 2;
+          const cy = dy + sh / 2;
+
+          // velocity away from the explosion center
+          const dirX = cx - explosionX;
+          const dirY = cy - explosionY;
+          const len = Math.max(0.001, Math.hypot(dirX, dirY));
+                    const nx = dirX / len, ny = dirY / len;
+
+          const speed = 250 + Math.random() * 420;
+          const vx = nx * speed + (Math.random() - 0.5) * 120;
+          const vy = ny * speed + (Math.random() - 0.5) * 120;
+
+          shards.push({
+            sx: dx, sy: dy, sw, sh,
+            dx, dy,
+            vx, vy,
+            rot: 0,
+            rv: (Math.random() - 0.5) * 6 // rotation speed
+          });
+        }
+      }
+    }
+    function drawBackground() {
+      const cw = canvas.width / dpr, ch = canvas.height / dpr;
+      if (!shards) {
+        ctx.drawImage(bgOff, 0, 0, cw, ch);
+      } else {
+        for (const s of shards) {
+          ctx.save();
+          ctx.translate(s.dx + s.sw / 2, s.dy + s.sh / 2);
+          ctx.rotate(s.rot);
+          ctx.drawImage(
+            bgOff,
+            s.sx, s.sy, s.sw, s.sh,
+            -s.sw / 2, -s.sh / 2, s.sw, s.sh
+          );
+          ctx.restore();
+        }
+      }
+    }
+    function updateShards(dt) {
+      if (!shards) return;
+      for (const s of shards) {
+        s.dx += s.vx * dt;
+        s.dy += s.vy * dt;
+        s.rot += s.rv * dt;
+      }
+    }
+
+    // =======================
+    // Entities: Player & Items
+    // =======================
+    class Player {
+      constructor(img) {
+        this.w = PLAYER_W;
+        this.h = PLAYER_H;
+        this.x = 100;
+        this.y = 0; // set in reset
+        this.img = img;
+      }
+      reset(cw, ch) {
+        this.x = cw / 2 - this.w / 2;
+        this.y = ch - this.h - 20;
+      }
+      update(dt, cw) {
+        let vx = 0;
+        if (keys.has('arrowleft') || keys.has('a')) vx -= PLAYER_SPEED;
+        if (keys.has('arrowright') || keys.has('d')) vx += PLAYER_SPEED;
+
+        if (vx !== 0) {
+          usingPointer = false; // keyboard overrides pointer steering
+          this.x += vx * dt;
+        } else if (usingPointer && pointerX != null) {
+          const targetX = pointerX - this.w / 2;
+          // Smooth follow
+          const dx = targetX - this.x;
+          this.x += dx * Math.min(1, dt * 12);
+        }
+
+        this.x = Math.max(0, Math.min(cw - this.w, this.x));
+      }
+      draw(ctx) {
+        if (this.img) {
+          ctx.drawImage(this.img, this.x, this.y, this.w, this.h);
+        } else {
+          ctx.fillStyle = '#4caf50';
+          ctx.fillRect(this.x, this.y, this.w, this.h);
+        }
+      }
+      get bounds() {
+        return { x: this.x, y: this.y, w: this.w, h: this.h };
+      }
+    }
+
+    class Item {
+      constructor(x, y, type, img) {
+        this.x = x;
+        this.y = y;
+        this.type = type; // 'normal' | 'rare'
+        if (type === 'normal') {
+          this.w = ITEM_W; this.h = ITEM_H;
+        } else {
+          this.w = RARE_W; this.h = RARE_H;
+        }
+        this.img = img;
+        this.vy = 0;
+        this.dead = false;
+      }
+      update(dt, speed) {
+        this.vy = speed;
+        this.y += this.vy * dt;
+      }
+      draw(ctx) {
+        if (this.img) ctx.drawImage(this.img, this.x, this.y, this.w, this.h);
+        else {
+          ctx.fillStyle = this.type === 'normal' ? '#ffcc00' : '#ff4444';
+          ctx.fillRect(this.x, this.y, this.w, this.h);
+        }
+      }
+      get bounds() {
+        return { x: this.x, y: this.y, w: this.w, h: this.h };
+      }
+    }
+
+    function aabbOverlap(a, b) {
+      return a.x < b.x + b.w &&
+             a.x + a.w > b.x &&
+             a.y < b.y + b.h &&
+             a.y + a.h > b.y;
+    }
+
+    // =======================
+    // Game state
+    // =======================
+    const hud = document.getElementById('hud');
+    const startOverlay = document.getElementById('startOverlay');
+
+    let IMAGES = { player: null, item: null, rare: null };
+    let SOUNDS = { catch: null, rare: null };
+
+    let player = null;
+    let items = [];
+    let score = 0;
+    let spawnTimer = 0;
+    let spawnInterval = BASE_SPAWN_INTERVAL;
+
+    let lastTime = 0;
+    let running = false;
+    let state = 'ready'; // 'ready' | 'playing' | 'exploding' | 'over'
+    let audioUnlocked = false;
+
+    let explosionT = 0;
+    let shakeAmp = 0;
+        let shockX = 0, shockY = 0;
+
+    function setHUD() {
+      hud.textContent = "Score: " + score;
+    }
+
+    function resetGame() {
+      const cw = canvas.width / dpr, ch = canvas.height / dpr;
+      items = [];
+      score = 0;
+      spawnTimer = 0;
+      spawnInterval = BASE_SPAWN_INTERVAL;
+
+      if (!player) player = new Player(IMAGES.player);
+      player.reset(cw, ch);
+
+      state = 'playing';
+      shards = null;
+      explosionT = 0;
+      shakeAmp = 0;
+      shockX = 0; shockY = 0;
+
+      setHUD();
+    }
+
+    function startIfNeeded() {
+      if (state === 'ready') {
+        unlockAudioOnce();
+        startOverlay.style.display = 'none';
+        resetGame();
+        if (!running) {
+          running = true;
+          lastTime = performance.now();
+          requestAnimationFrame(loop);
+        }
+      }
+    }
+
+    function unlockAudioOnce() {
+      if (audioUnlocked) return;
+      audioUnlocked = true;
+      // Attempt unlocking via quick play/pause (will be ignored if not needed)
+      [SOUNDS.catch, SOUNDS.rare].forEach(a => {
+        if (!a) return;
+        try {
+          a.volume = 0;
+          a.play().then(() => {
+            a.pause();
+            a.currentTime = 0;
+            a.volume = 1;
+          }).catch(() => {});
+        } catch (e) {}
+      });
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (state === 'over' && e.key.toLowerCase() === 'r') {
+        resetGame();
+      }
+    });
+
+    // =======================
+    // Spawning
+    // =======================
+    function spawnItem() {
+      const cw = canvas.width / dpr;
+      const type = Math.random() < RARE_CHANCE ? 'rare' : 'normal';
+      const w = type === 'rare' ? RARE_W : ITEM_W;
+      const x = Math.random() * (cw - w);
+      const y = -120; // start above
+      const img = type === 'rare' ? IMAGES.rare : IMAGES.item;
+      items.push(new Item(x, y, type, img));
+      if (items.length > MAX_ITEMS_ON_SCREEN) {
+        items.shift();
+      }
+    }
+
+    // =======================
+    // Explosion trigger
+    // =======================
+    function triggerExplosion(cx, cy) {
+      state = 'exploding';
+      explosionT = 0;
+      shakeAmp = SHAKE_MAX;
+      shockX = cx;
+      shockY = cy;
+      createShards(cx, cy);
+      playSound(SOUNDS.rare, 1.0);
+    }
+
+    // =======================
+    // Loop
+    // =======================
+    function loop(t) {
+      if (!running) return;
+      const dt = Math.min(0.033, (t - lastTime) / 1000);
+      lastTime = t;
+
+      // Update
+      const cw = canvas.width / dpr, ch = canvas.height / dpr;
+
+      if (state === 'playing') {
+        player.update(dt, cw);
+
+        // Spawn items
+        spawnTimer += dt;
+        const desiredInterval = Math.max(0.35, BASE_SPAWN_INTERVAL - score * 0.01);
+        if (spawnTimer >= spawnInterval) {
+          spawnItem();
+          spawnTimer = 0;
+          spawnInterval = desiredInterval * (0.8 + Math.random() * 0.4);
+        }
+
+        // Update items
+        const fallSpeed = FALL_SPEED_BASE + score * FALL_SPEED_PER_SCORE;
+        for (const it of items) {
+          it.update(dt, fallSpeed);
+        }
+
+        // Remove items off-screen
+        for (const it of items) {
+          if (it.y > ch + 150) it.dead = true;
+        }
+        items = items.filter(i => !i.dead);
+
+        // Collisions
+        const pb = player.bounds;
+        for (const it of items) {
+          if (!it.dead && aabbOverlap(pb, it.bounds)) {
+            if (it.type === 'normal') {
+              it.dead = true;
+              score += 1;
+              setHUD();
+              playSound(SOUNDS.catch, 1.0);
+            } else {
+              // rare item caught -> explode background and lose
+              triggerExplosion(it.x + it.w / 2, it.y + it.h / 2);
+              it.dead = true;
+            }
+          }
+        }
+        items = items.filter(i => !i.dead);
+      } else if (state === 'exploding') {
+        explosionT += dt;
+        updateShards(dt);
+        shakeAmp = Math.max(0, SHAKE_MAX * (1 - explosionT / EXPLOSION_DURATION));
+                if (explosionT >= EXPLOSION_DURATION) {
+          state = 'over';
+        }
+      }
+
+      // Draw
+      // Screen shake
+      const shakeX = state === 'exploding' ? (Math.random() * 2 - 1) * shakeAmp : 0;
+      const shakeY = state === 'exploding' ? (Math.random() * 2 - 1) * shakeAmp : 0;
+      ctx.setTransform(1,0,0,1,shakeX,shakeY);
+      ctx.scale(dpr, dpr); // reapply DPR scaling for drawing in CSS px
+
+      // Background and flash
+      drawBackground();
+
+      if (state !== 'exploding' && state !== 'over') {
+        // Normal draw
+        for (const it of items) it.draw(ctx);
+        player.draw(ctx);
+      } else {
+        // During/After explosion, still show items/player under flash if desired
+        for (const it of items) it.draw(ctx);
+        player.draw(ctx);
+
+        // White flash at the beginning of explosion
+        if (state === 'exploding' && explosionT < WHITE_FLASH_TIME) {
+          const alpha = 1 - explosionT / WHITE_FLASH_TIME;
+          ctx.fillStyle = 'rgba(255,255,255,alpha)';
+          ctx.fillRect(0, 0, cw, ch);
+        }
+      }
+
+      // Game over overlay text
+      if (state === 'over') {
+        ctx.setTransform(1,0,0,1,0,0);
+        ctx.scale(dpr, dpr);
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(0, 0, cw, ch);
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = 'bold 36px system-ui, sans-serif';
+        ctx.fillText('Game Over', cw/2, ch/2 - 20);
+        ctx.font = '18px system-ui, sans-serif';
+        ctx.fillText("Final Score: " + score, cw/2, ch/2 + 14);
+        ctx.fillText('Press R to restart', cw/2, ch/2 + 44);
+      }
+
+      requestAnimationFrame(loop);
+    }
+
+    // =======================
+    // Boot
+    // =======================
+    (async function boot() {
+      resizeCanvas();
+      prepareBackground();
+
+      try {
+        const [playerImg, itemImg, rareImg] = await Promise.all([
+          loadImage(PLAYER_IMG_SRC),
+          loadImage(ITEM_IMG_SRC),
+          loadImage(RARE_IMG_SRC)
+        ]);
+        IMAGES.player = playerImg;
+        IMAGES.item = itemImg;
+        IMAGES.rare = rareImg;
+      } catch (e) {
+        console.warn('Image failed to load:', e);
+      }
+
+      SOUNDS.catch = CATCH_SOUND_SRC ? loadAudio(CATCH_SOUND_SRC) : null;
+      SOUNDS.rare  = RARE_SOUND_SRC ? loadAudio(RARE_SOUND_SRC) : null;
+
+      // Wait for user gesture to start (and unlock audio)
+      state = 'ready';
+      startOverlay.style.display = 'flex';
+
+      // Also allow clicking the overlay to start
+      startOverlay.addEventListener('pointerdown', () => startIfNeeded(), { once: true });
+      window.addEventListener('keydown', () => startIfNeeded(), { once: true });
+    })();
+  </script>
+</body>
+</html>
